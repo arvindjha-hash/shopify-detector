@@ -14,20 +14,24 @@ uploaded_file = st.file_uploader("Upload TXT file with URLs (one per line)")
 workers = st.slider("Parallel workers", 5, 50, 20)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
     "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
 # Order matters: more specific platforms first
 PLATFORMS = {
-    "Shopify": ["cdn.shopify.com", "/cdn/shopify/", "shopify.theme", "myshopify.com",
-                "shopify-section", "shopify.shop", "shopify-payment-button"],
-    "WooCommerce": ["wp-content/plugins/woocommerce", "wc-ajax", "wc_add_to_cart",
-                    "woocommerce-"],
-    "Magento": ["mage-init", "mage/cookies", "/static/frontend/", "x-magento",
-                "magento_"],
+    "Shopify": [
+        "cdn.shopify.com", "/cdn/shopify/", "shopify.theme", "myshopify.com",
+        "shopify-section", "shopify.shop", "shopify-payment-button",
+    ],
+    "WooCommerce": [
+        "wp-content/plugins/woocommerce", "wc-ajax", "wc_add_to_cart", "woocommerce-",
+    ],
+    "Magento": ["mage-init", "mage/cookies", "/static/frontend/", "x-magento", "magento_"],
     "BigCommerce": ["cdn11.bigcommerce.com", "bigcommerce.com"],
     "Salesforce Commerce Cloud": ["demandware", "/on/demandware.store"],
     "PrestaShop": ["prestashop", "/modules/ps_"],
@@ -68,12 +72,12 @@ def normalize(u):
 def safe_get(url, timeout=12):
     """GET with SSL fallback. Returns (response, error_string)."""
     try:
-        return requests.get(url, headers=HEADERS, timeout=timeout,
-                            allow_redirects=True), None
+        return requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True), None
     except requests.exceptions.SSLError:
         try:
-            return requests.get(url, headers=HEADERS, timeout=timeout,
-                                allow_redirects=True, verify=False), None
+            return requests.get(
+                url, headers=HEADERS, timeout=timeout, allow_redirects=True, verify=False
+            ), None
         except Exception as e:
             return None, f"SSL error: {type(e).__name__}"
     except requests.exceptions.Timeout:
@@ -87,9 +91,9 @@ def safe_get(url, timeout=12):
 def get_homepage(url):
     r, err = safe_get(url)
     if r is None and url.startswith("https://"):
-        r, err2 = safe_get("http://" + url[len("https://"):])
-        if r is not None:
-            err = None
+        r2, err2 = safe_get("http://" + url[len("https://"):])
+        if r2 is not None:
+            return r2, None
     return r, err
 
 
@@ -111,14 +115,16 @@ def check_shopify_api(base):
                     try:
                         if float(v.get("price") or 0) > 0 and v.get("available"):
                             return True, True, "priced, available products in /products.json"
-                    except ValueError:
+                    except (ValueError, TypeError):
                         pass
             return True, False, "Shopify, but no priced/available products in feed"
+
     cr, _ = safe_get(f"{base}/cart.js")
     if cr is not None and cr.status_code == 200:
         data = json_or_none(cr)
         if isinstance(data, dict) and ("token" in data or "items" in data):
             return True, False, "/cart.js returned Shopify cart JSON"
+
     return False, False, ""
 
 
@@ -129,13 +135,13 @@ def check_site(raw):
         r, err = get_homepage(url)
 
         if r is None:
-            out["Platform"], out["Notes"] = "Error", err
+            out["Platform"], out["Notes"] = "Error", err or "Request failed"
             return out
 
         p = urlparse(r.url)
         base = f"{p.scheme}://{p.netloc}"
         blocked = r.status_code in (401, 403, 429, 503)
-        html = r.text.lower() if not blocked or r.text else ""
+        html = (r.text or "").lower()
         hdrs = " ".join(f"{k}:{v}" for k, v in r.headers.items()).lower()
         blob = html + " " + hdrs
 
@@ -172,10 +178,17 @@ def check_site(raw):
             if not has_cart and platform:
                 for path in ("/cart", "/checkout"):
                     cr, _ = safe_get(base + path, timeout=8)
-                    if cr is not None and cr.status_code == 200 and any(
-                            s in cr.text.lower() for s in CART_SIGNALS + ["checkout", "your cart"]):
+                    if (
+                        cr is not None
+                        and cr.status_code == 200
+                        and any(
+                            s in cr.text.lower()
+                            for s in CART_SIGNALS + ["checkout", "your cart"]
+                        )
+                    ):
                         has_cart = True
                         break
+
             if has_cart and gateways:
                 pay, note = "Yes", "Cart + gateway: " + ", ".join(gateways[:3])
             elif has_cart:
@@ -192,4 +205,58 @@ def check_site(raw):
             note = f"Homepage blocked (HTTP {r.status_code}). " + note
 
         out.update({"Platform": platform, "Online Payment": pay, "Notes": note})
+
     except Exception as e:
+        out.update({"Platform": "Error", "Notes": f"{type(e).__name__}: {e}"})
+
+    return out
+
+
+def decode_bytes(raw):
+    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+if uploaded_file:
+    text = decode_bytes(uploaded_file.read())
+    urls = list(dict.fromkeys(x.strip() for x in text.splitlines() if x.strip()))
+
+    if not urls:
+        st.warning("No URLs found in the file.")
+        st.stop()
+
+    results = [None] * len(urls)
+    progress = st.progress(0)
+    status = st.empty()
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(check_site, u): i for i, u in enumerate(urls)}
+        done = 0
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as e:
+                results[i] = {
+                    "URL": urls[i],
+                    "Platform": "Error",
+                    "Online Payment": "Unknown",
+                    "Notes": str(e),
+                }
+            done += 1
+            progress.progress(done / len(urls))
+            status.text(f"Checked {done}/{len(urls)}")
+
+    df = pd.DataFrame(results)
+    st.dataframe(df, use_container_width=True)
+
+    st.download_button(
+        "Download Results",
+        df.to_csv(index=False).encode("utf-8"),
+        "ecommerce_results.csv",
+        "text/csv",
+    )
